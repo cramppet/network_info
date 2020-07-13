@@ -87,7 +87,7 @@ def parse_property_inetnum(block: str) -> str:
         return match[0]
     # LACNIC WHOIS IPv4 
     match = re.findall(
-        rb'^(inetnum):[\s]*((?:\d{1,3}\.){1,3}\d{1,3}/\d{1,2})', block, re.MULTILINE)
+        rb'^inetnum:[\s]*((?:\d{1,3}\.){1,3}\d{1,3}/\d{1,2})', block, re.MULTILINE)
     if match:
         # LACNIC appears to be using a shorthand notation for CIDR ranges. I 
         # have noticed that when a network ends with octets of 0, these octets 
