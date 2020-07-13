@@ -16,7 +16,8 @@ import math
 
 VERSION = '2.0'
 FILELIST = ['afrinic.db.gz', 'apnic.db.inet6num.gz', 'apnic.db.inetnum.gz', 
-            'arin.db', 'lacnic.db', 'ripe.db.inetnum.gz', 'ripe.db.inet6num.gz']
+            'arin.db.gz', 'arin-nonauth.db.gz', 'lacnic.db.gz', 'ripe.db.inetnum.gz', 
+            'ripe.db.inet6num.gz']
 NUM_WORKERS = cpu_count()
 LOG_FORMAT = '%(asctime)-15s - %(name)-9s - %(levelname)-8s - %(processName)-11s - %(filename)s - %(message)s'
 COMMIT_COUNT = 10000
@@ -70,7 +71,7 @@ def parse_property(block: str, name: str) -> str:
 
 
 def parse_property_inetnum(block: str) -> str:
-    # IPv4
+    # RIR WHOIS IPv4
     match = re.findall(
         rb'^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})', block, re.MULTILINE)
     if match:
@@ -79,15 +80,20 @@ def parse_property_inetnum(block: str) -> str:
         ip_end = match[0][1].decode('utf-8')
         cidrs = iprange_to_cidrs(ip_start, ip_end)
         return cidrs
-    # IPv6
+    # RIR WHOIS IPv6
     match = re.findall(
         rb'^inet6num:[\s]*([0-9a-fA-F:\/]{1,43})', block, re.MULTILINE)
     if match:
         return match[0]
-    # LACNIC translation for IPv4
+    # LACNIC WHOIS IPv4 
     match = re.findall(
-        rb'^inetnum:[\s]*((?:\d{1,3}\.){1,3}\d{1,3}/\d{1,2})', block, re.MULTILINE)
+        rb'^(inetnum):[\s]*((?:\d{1,3}\.){1,3}\d{1,3}/\d{1,2})', block, re.MULTILINE)
     if match:
+        # LACNIC appears to be using a shorthand notation for CIDR ranges. I 
+        # have noticed that when a network ends with octets of 0, these octets 
+        # are sometimes omitted; leaving you with values like '1.0/16' and 
+        # '1.0.0/24'. These may equally be mistakes, though there are quite a
+        # few compelling cases in the file which make it seem otherwise.
         if match[0].count(b'.') == 1:
             idx = match[0].index(b'/')
             prefix = match[0][:idx].decode("utf-8")
@@ -100,6 +106,20 @@ def parse_property_inetnum(block: str) -> str:
             return f'{prefix}.0{suffix}'.encode('utf-8')
         else:
             return match[0]
+    # ARIN does not publish a raw WHOIS database like the other registrars,
+    # instead they publish routing data as part of the IRR program. This data
+    # is similar but not equivalent to the WHOIS database and more importantly,
+    # the format is distinct from the one above, it is a dump in RPSL (Routing
+    # Policy Specification Language) defined in RFC 2622.
+    #
+    # Objects of particular interest are the "route" and "route6" objects
+    # which define IP routes that are used, in a small way, to help provide 
+    # routing for the public Internet in conjunction with the BGP protocol: 
+    #
+    # https://tools.ietf.org/html/rfc2622#page-12
+    #
+    # TODO: Put logic for parsing IRR data format from ARIN and other members
+    # of the IRR program: http://www.irr.net/docs/list.html
     logger.warning(f"Could not parse inetnum on block {block}")
     return None
 

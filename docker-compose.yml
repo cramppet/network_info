@@ -1,7 +1,7 @@
 version: "3.7"
 services:
   network_info:
-    image: network_info
+    image: sample:latest
     build:
       context: .
     command: -c postgres://network_info:network_info@db:5432/network_info
