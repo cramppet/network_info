@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import re
 import argparse
 import gzip
 import time
-from multiprocessing import cpu_count, Queue, Process, current_process
+import csv
 import logging
-
-import re
-import os.path
-from db.model import Block
-from db.helper import setup_connection
-from netaddr import iprange_to_cidrs
 import math
+import os
+import os.path
 
-VERSION = '2.0'
+from netaddr import iprange_to_cidrs
+
+
+# I removed arin.db.gz, arin-nonauth.db.gz, if you have access to the real ARIN
+# data dumps, feel free to re-add them.
 FILELIST = ['afrinic.db.gz', 'apnic.db.inet6num.gz', 'apnic.db.inetnum.gz', 
-            'arin.db.gz', 'arin-nonauth.db.gz', 'lacnic.db.gz', 'ripe.db.inetnum.gz', 
-            'ripe.db.inet6num.gz']
-NUM_WORKERS = cpu_count()
+            'lacnic.db.gz', 'ripe.db.inetnum.gz', 'ripe.db.inet6num.gz']
+
+NUM_WORKERS = 1
 LOG_FORMAT = '%(asctime)-15s - %(name)-9s - %(levelname)-8s - %(processName)-11s - %(filename)s - %(message)s'
-COMMIT_COUNT = 10000
-NUM_BLOCKS = 0
 CURRENT_FILENAME = "empty"
+VERSION = '2.0'
 
 
 class ContextFilter(logging.Filter):
@@ -106,20 +106,8 @@ def parse_property_inetnum(block: str) -> str:
             return f'{prefix}.0{suffix}'.encode('utf-8')
         else:
             return match[0]
-    # ARIN does not publish a raw WHOIS database like the other registrars,
-    # instead they publish routing data as part of the IRR program. This data
-    # is similar but not equivalent to the WHOIS database and more importantly,
-    # the format is distinct from the one above, it is a dump in RPSL (Routing
-    # Policy Specification Language) defined in RFC 2622.
-    #
-    # Objects of particular interest are the "route" and "route6" objects
-    # which define IP routes that are used, in a small way, to help provide 
-    # routing for the public Internet in conjunction with the BGP protocol: 
-    #
-    # https://tools.ietf.org/html/rfc2622#page-12
-    #
-    # TODO: Put logic for parsing IRR data format from ARIN and other members
-    # of the IRR program: http://www.irr.net/docs/list.html
+   # TODO: Logic for parsing IRR data format from ARIN and other members of the 
+   # IRR program: http://www.irr.net/docs/list.html
     logger.warning(f"Could not parse inetnum on block {block}")
     return None
 
@@ -129,6 +117,7 @@ def read_blocks(filename: str) -> list:
         opemethod = gzip.open
     else:
         opemethod = open
+
     cust_source = get_source(filename.split('/')[-1])
     single_block = b''
     blocks = []
@@ -145,8 +134,7 @@ def read_blocks(filename: str) -> list:
                     single_block += b"cust_source: %s" % (cust_source)
                     blocks.append(single_block)
                     if len(blocks) % 1000 == 0:
-                        logger.debug(
-                            f"parsed another 1000 blocks ({len(blocks)} so far)")
+                        logger.debug(f"parsed another 1000 blocks ({len(blocks)} so far)")
                     single_block = b''
                     # comment out to only parse x blocks
                     # if len(blocks) == 100:
@@ -155,24 +143,15 @@ def read_blocks(filename: str) -> list:
                     single_block = b''
             else:
                 single_block += line
+    
     logger.info(f"Got {len(blocks)} blocks")
     global NUM_BLOCKS
     NUM_BLOCKS = len(blocks)
     return blocks
 
 
-def parse_blocks(jobs: Queue, connection_string: str):
-    session = setup_connection(connection_string)
-
-    counter = 0
-    BLOCKS_DONE = 0
-
-    start_time = time.time()
-    while True:
-        block = jobs.get()
-        if block is None:
-            break
-
+def parse_blocks(blocks, csv_writer):
+    for block in blocks:
         inetnum = parse_property_inetnum(block)
         netname = parse_property(block, b'netname')
         description = parse_property(block, b'descr')
@@ -184,95 +163,50 @@ def parse_blocks(jobs: Queue, connection_string: str):
 
         if isinstance(inetnum, list):
             for cidr in inetnum:
-                b = Block(inetnum=str(cidr), netname=netname, description=description, country=country,
-                          maintained_by=maintained_by, created=created, last_modified=last_modified, source=source)
-                session.add(b)
+                row = [str(cidr), netname, description, country, maintained_by, created, last_modified, source]
+                csv_writer.writerow(row)
         else:
-            b = Block(inetnum=inetnum.decode('utf-8'), netname=netname, description=description, country=country,
-                      maintained_by=maintained_by, created=created, last_modified=last_modified, source=source)
-            session.add(b)
-
-        counter += 1
-        BLOCKS_DONE += 1
-        if counter % COMMIT_COUNT == 0:
-            session.commit()
-            session.close()
-            session = setup_connection(connection_string)
-            # not really accurate at the moment
-            percent = (BLOCKS_DONE * NUM_WORKERS * 100) / NUM_BLOCKS
-            if percent > 100:
-                percent = 100
-            logger.debug('committed {} blocks ({} seconds) {:.1f}% done.'.format(
-                counter, round(time.time() - start_time, 2), percent))
-            counter = 0
-            start_time = time.time()
-    session.commit()
-    logger.debug('committed last blocks')
-    session.close()
-    logger.debug(f"{current_process().name} finished")
+            row = [inetnum.decode("utf-8"), netname, description, country, maintained_by, created, last_modified, source]
+            csv_writer.writerow(row)
 
 
-def main(connection_string):
+def main(output_file):
     overall_start_time = time.time()
-    session = setup_connection(connection_string, create_db=True)
 
-    for entry in FILELIST:
-        global CURRENT_FILENAME
-        CURRENT_FILENAME = entry
-        f_name = f"./databases/{entry}"
-        if os.path.exists(f_name):
-            logger.info(f"parsing database file: {f_name}")
-            start_time = time.time()
-            blocks = read_blocks(f_name)
-            logger.info(
-                f"database parsing finished: {round(time.time() - start_time, 2)} seconds")
+    with open(output_file, 'w') as output_file_handle:
+        csv_writer = csv.writer(output_file_handle, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
+        for entry in FILELIST:
+            global CURRENT_FILENAME
+            CURRENT_FILENAME = entry
+            f_name = f"./databases/{entry}"
 
-            logger.info('parsing blocks')
-            start_time = time.time()
+            if os.path.exists(f_name):
+                logger.info(f"parsing database file: {f_name}")
+                start_time = time.time()
+                blocks = read_blocks(f_name)
+                logger.info(f"database parsing finished: {round(time.time() - start_time, 2)} seconds")
 
-            jobs = Queue()
+                logger.info('parsing blocks')
+                start_time = time.time()
+                parse_blocks(blocks, csv_writer)
+                logger.info(f"block parsing finished: {round(time.time() - start_time, 2)} seconds")
+            else:
+                logger.info(f"File {f_name} not found. Please download using download_dumps.sh")
 
-            workers = []
-            # start workers
-            logger.debug(f"starting {NUM_WORKERS} processes")
-            for w in range(NUM_WORKERS):
-                p = Process(target=parse_blocks, args=(
-                    jobs, connection_string,), daemon=True)
-                p.start()
-                workers.append(p)
-
-            # add tasks
-            for b in blocks:
-                jobs.put(b)
-            for i in range(NUM_WORKERS):
-                jobs.put(None)
-            jobs.close()
-            jobs.join_thread()
-
-            # wait to finish
-            for p in workers:
-                p.join()
-
-            logger.info(
-                f"block parsing finished: {round(time.time() - start_time, 2)} seconds")
-        else:
-            logger.info(
-                f"File {f_name} not found. Please download using download_dumps.sh")
+    print('Done!')
 
     CURRENT_FILENAME = "empty"
-    logger.info(
-        f"script finished: {round(time.time() - overall_start_time, 2)} seconds")
+    logger.info(f"script finished: {round(time.time() - overall_start_time, 2)} seconds")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Create DB')
-    parser.add_argument('-c', dest='connection_string', type=str,
-                        required=True, help="Connection string to the postgres database")
-    parser.add_argument("-d", "--debug", action="store_true",
-                        help="set loglevel to DEBUG")
-    parser.add_argument('--version', action='version',
-                        version=f"%(prog)s {VERSION}")
+    parser = argparse.ArgumentParser(description='Parse WHOIS databases into single TSV file')
+    parser.add_argument('-o', dest='output_file', type=str, required=True, help="Output TSV file")
+    parser.add_argument("-d", "--debug", action="store_true", help="set loglevel to DEBUG")
+    parser.add_argument('--version', action='version', version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
+
     if args.debug:
         logger.setLevel(logging.DEBUG)
-    main(args.connection_string)
+
+    main(args.output_file)
