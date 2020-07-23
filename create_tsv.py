@@ -158,13 +158,64 @@ def read_blocks(filename: str) -> list:
 
 
 def parse_blocks(blocks, csv_writer):
+    def is_arin_customer(block):
+        return block.startswith('OrgID:')
+
+    def is_arin_network(block):
+        return block.startswith('NetHandle:') or block.startswith('V6NetHandle:')
+
     for block in blocks:
         b = block.decode('utf-8', 'ignore') 
-        try:
-            rpsl_object = rpsl_object_from_text(b)
-            logger.info(rpsl_object)
-        except Exception as ex:
-            logger.error(ex)
+
+        # ARIN has an Organization object which you have to parse out in order
+        # to get any details about network blocks
+        if is_arin_customer(b):
+            orgid = parse_property(b, 'OrgID')
+            orgname = parse_property(b, 'OrgName')
+            country = parse_property(b, 'Country')
+            ARIN_ORGS[orgid] = (orgname, country)
+            continue
+
+        # ARIN's dump format is also not in RPSL for whatever reason. They
+        # decided to make their own custom format.
+        elif is_arin_network(b):
+            inetnum = parse_property_inetnum(b)
+            orgid = parse_property(b, 'OrgID')
+            netname = parse_property(b, 'NetName')
+            description = parse_property(b, 'NetHandle')
+            # ARIN IPv6
+            if not description:
+                description = parse_property(b, 'V6NetHandle')
+            country = ARIN_ORGS[orgid][1]
+            maintained_by = ARIN_ORGS[orgid][0]
+            created = parse_property(b, 'RegDate')
+            last_modified = parse_property(b, 'Updated')
+            source = parse_property(b, 'cust_source')
+
+        # All other data dumps are in RPSL so we can use a proper parser
+        # provided by the irrd package
+        else:
+            try:
+                rpsl_object = rpsl_object_from_text(b)
+                logger.info(rpsl_object)
+            except Exception as ex:
+                logger.error(ex)
+            # inetnum = parse_property_inetnum(block)
+            # netname = parse_property(block, b'netname')
+            # description = parse_property(block, b'descr')
+            # country = parse_property(block, b'country')
+            # maintained_by = parse_property(block, b'mnt-by')
+            # created = parse_property(block, b'created')
+            # last_modified = parse_property(block, b'last-modified')
+            # source = parse_property(block, b'cust_source')
+
+        if isinstance(inetnum, list):
+            for cidr in inetnum:
+                row = [str(cidr), netname, description, country, maintained_by, created, last_modified, source]
+                csv_writer.writerow(row)
+        else:
+            row = [inetnum.decode("utf-8"), netname, description, country, maintained_by, created, last_modified, source]
+            csv_writer.writerow(row)
 
 
 def main(output_file):
