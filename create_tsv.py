@@ -12,14 +12,21 @@ import os
 import os.path
 
 from netaddr import iprange_to_cidrs
+from irrd.rpsl.rpsl_objects import rpsl_object_from_text
 
 
 # I removed arin.db.gz, arin-nonauth.db.gz, if you have access to the real ARIN
 # data dumps, feel free to re-add them.
-FILELIST = ['afrinic.db.gz', 'apnic.db.inet6num.gz', 'apnic.db.inetnum.gz', 
-            'lacnic.db.gz', 'ripe.db.inetnum.gz', 'ripe.db.inet6num.gz']
+FILELIST = [
+    'afrinic.db.gz', 
+    'apnic.db.inet6num.gz', 
+    'apnic.db.inetnum.gz', 
+    'lacnic.db.gz', 
+    'ripe.db.inetnum.gz', 
+    'ripe.db.inet6num.gz'
+]
 
-NUM_WORKERS = 1
+ARIN_ORGS = {}
 LOG_FORMAT = '%(asctime)-15s - %(name)-9s - %(levelname)-8s - %(processName)-11s - %(filename)s - %(message)s'
 CURRENT_FILENAME = "empty"
 VERSION = '2.0'
@@ -31,7 +38,7 @@ class ContextFilter(logging.Filter):
         return True
 
 
-logger = logging.getLogger('create_db')
+logger = logging.getLogger('create_tsv')
 logger.setLevel(logging.INFO)
 f = ContextFilter()
 logger.addFilter(f)
@@ -57,7 +64,7 @@ def get_source(filename: str):
     return None
 
 
-def parse_property(block: str, name: str) -> str:
+def parse_arin_property(block: str, name: str) -> str:
     match = re.findall(b'^%s:\s?(.+)$' % (name), block, re.MULTILINE)
     if match:
         # remove empty lines and remove multiple names
@@ -70,45 +77,24 @@ def parse_property(block: str, name: str) -> str:
         return None
 
 
-def parse_property_inetnum(block: str) -> str:
-    # RIR WHOIS IPv4
-    match = re.findall(
-        rb'^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})', block, re.MULTILINE)
+def parse_arin_inetnum(block: str) -> str:
+    # ARIN WHOIS IPv4
+    match = re.findall(rb'^NetRange:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})', block, re.MULTILINE)
     if match:
         # netaddr can only handle strings, not bytes
         ip_start = match[0][0].decode('utf-8')
         ip_end = match[0][1].decode('utf-8')
         cidrs = iprange_to_cidrs(ip_start, ip_end)
         return cidrs
-    # RIR WHOIS IPv6
-    match = re.findall(
-        rb'^inet6num:[\s]*([0-9a-fA-F:\/]{1,43})', block, re.MULTILINE)
+    # ARIN WHOIS IPv6
+    match = re.findall(rb'^NetRange:[\s]*([0-9a-fA-F:\/]{1,43})[\s]*-[\s]*([0-9a-fA-F:\/]{1,43})', block, re.MULTILINE)
     if match:
-        return match[0]
-    # LACNIC WHOIS IPv4 
-    match = re.findall(
-        rb'^inetnum:[\s]*((?:\d{1,3}\.){1,3}\d{1,3}/\d{1,2})', block, re.MULTILINE)
-    if match:
-        # LACNIC appears to be using a shorthand notation for CIDR ranges. I 
-        # have noticed that when a network ends with octets of 0, these octets 
-        # are sometimes omitted; leaving you with values like '1.0/16' and 
-        # '1.0.0/24'. These may equally be mistakes, though there are quite a
-        # few compelling cases in the file which make it seem otherwise.
-        if match[0].count(b'.') == 1:
-            idx = match[0].index(b'/')
-            prefix = match[0][:idx].decode("utf-8")
-            suffix = match[0][idx:].decode("utf-8")
-            return f'{prefix}.0.0{suffix}'.encode('utf-8')
-        elif match[0].count(b'.') == 2:
-            idx = match[0].index(b'/')
-            prefix = match[0][:idx].decode("utf-8")
-            suffix = match[0][idx:].decode("utf-8")
-            return f'{prefix}.0{suffix}'.encode('utf-8')
-        else:
-            return match[0]
-   # TODO: Logic for parsing IRR data format from ARIN and other members of the 
-   # IRR program: http://www.irr.net/docs/list.html
-    logger.warning(f"Could not parse inetnum on block {block}")
+        # netaddr can only handle strings, not bytes
+        ip_start = match[0][0].decode('utf-8')
+        ip_end = match[0][1].decode('utf-8')
+        cidrs = iprange_to_cidrs(ip_start, ip_end)
+        return cidrs
+    logger.warning(f"Could not parse ARIN block {block}")
     return None
 
 
@@ -122,23 +108,44 @@ def read_blocks(filename: str) -> list:
     single_block = b''
     blocks = []
 
+    # APNIC/LACNIC/RIPE/AFRINIC/IRR are all in RPSL
+    def is_rpsl_block_start(line):
+        if line.startswith(b'inetnum:'):
+            return True
+        elif line.startswith(b'inet6num:'):
+            return True
+        elif line.startswith(b'route:'):
+            return True
+        elif line.startswith(b'route6:'):
+            return True
+        elif line.startswith(b'route-set:'):
+            return True
+        return False
+
+    # ARIN's WHOIS database is in a custom format
+    def is_arin_block_start(line):
+        if line.startswith(b'NetHandle:'):
+            return True
+        elif line.startswith(b'V6NetHandle:'):
+            return True
+        elif line.startswith(b'OrgID:'):
+            return True
+        return False
+
     with opemethod(filename, mode='rb') as f:
         for line in f:
             # skip comments
-            if line.startswith(b'%') or line.startswith(b'#') or line.startswith(b'remarks:'):
+            if line.startswith(b'%') or line.startswith(b'#'):
                 continue
             # block end
             if line.strip() == b'':
-                if single_block.startswith(b'inetnum:') or single_block.startswith(b'inet6num:'):
+                if is_rpsl_block_start(single_block) or is_arin_block_start(single_block):
                     # add source
                     single_block += b"cust_source: %s" % (cust_source)
                     blocks.append(single_block)
                     if len(blocks) % 1000 == 0:
                         logger.debug(f"parsed another 1000 blocks ({len(blocks)} so far)")
                     single_block = b''
-                    # comment out to only parse x blocks
-                    # if len(blocks) == 100:
-                    #    break
                 else:
                     single_block = b''
             else:
@@ -152,22 +159,12 @@ def read_blocks(filename: str) -> list:
 
 def parse_blocks(blocks, csv_writer):
     for block in blocks:
-        inetnum = parse_property_inetnum(block)
-        netname = parse_property(block, b'netname')
-        description = parse_property(block, b'descr')
-        country = parse_property(block, b'country')
-        maintained_by = parse_property(block, b'mnt-by')
-        created = parse_property(block, b'created')
-        last_modified = parse_property(block, b'last-modified')
-        source = parse_property(block, b'cust_source')
-
-        if isinstance(inetnum, list):
-            for cidr in inetnum:
-                row = [str(cidr), netname, description, country, maintained_by, created, last_modified, source]
-                csv_writer.writerow(row)
-        else:
-            row = [inetnum.decode("utf-8"), netname, description, country, maintained_by, created, last_modified, source]
-            csv_writer.writerow(row)
+        b = block.decode('utf-8', 'ignore') 
+        try:
+            rpsl_object = rpsl_object_from_text(b)
+            logger.info(rpsl_object)
+        except Exception as ex:
+            logger.error(ex)
 
 
 def main(output_file):
@@ -185,15 +182,12 @@ def main(output_file):
                 start_time = time.time()
                 blocks = read_blocks(f_name)
                 logger.info(f"database parsing finished: {round(time.time() - start_time, 2)} seconds")
-
                 logger.info('parsing blocks')
                 start_time = time.time()
                 parse_blocks(blocks, csv_writer)
                 logger.info(f"block parsing finished: {round(time.time() - start_time, 2)} seconds")
             else:
                 logger.info(f"File {f_name} not found. Please download using download_dumps.sh")
-
-    print('Done!')
 
     CURRENT_FILENAME = "empty"
     logger.info(f"script finished: {round(time.time() - overall_start_time, 2)} seconds")
