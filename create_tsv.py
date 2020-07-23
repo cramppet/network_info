@@ -15,15 +15,31 @@ from netaddr import iprange_to_cidrs
 from irrd.rpsl.rpsl_objects import rpsl_object_from_text
 
 
-# I removed arin.db.gz, arin-nonauth.db.gz, if you have access to the real ARIN
-# data dumps, feel free to re-add them.
 FILELIST = [
+    'arin_db.txt',
+
     'afrinic.db.gz', 
+
     'apnic.db.inet6num.gz', 
     'apnic.db.inetnum.gz', 
+    'apnic.db.route-set.gz', 
+    'apnic.db.route.gz', 
+    'apnic.db.route6.gz', 
+
     'lacnic.db.gz', 
+
     'ripe.db.inetnum.gz', 
-    'ripe.db.inet6num.gz'
+    'ripe.db.inet6num.gz',
+    'ripe.db.route-set.gz',
+    'ripe.db.route.gz',
+    'ripe.db.route6.gz',
+
+    'arin.db.gz',
+    'arin-nonauth.db.gz',
+    'level3.db.gz',
+    'nttcom.db.gz',
+    'radb.db.gz',
+    'tc.db.gz'
 ]
 
 ARIN_ORGS = {}
@@ -59,39 +75,47 @@ def get_source(filename: str):
         return b'lacnic'
     elif filename.startswith('ripe'):
         return b'ripe'
+    elif filename.startswith('level3'):
+        return b'level3'
+    elif filename.startswith('nttcom'):
+        return b'nttcom'
+    elif filename.startswith('radb'):
+        return b'radb'
+    elif filename.startswith('tc'):
+        return b'tc'
     else:
         logger.error(f"Can not determine source for {filename}")
     return None
 
 
-def parse_arin_property(block: str, name: str) -> str:
-    match = re.findall(b'^%s:\s?(.+)$' % (name), block, re.MULTILINE)
+def parse_property(block: str, name: str) -> str:
+    match = re.findall('^%s:\s?(.+)$' % (name), block, re.MULTILINE)
     if match:
         # remove empty lines and remove multiple names
-        x = b' '.join(list(filter(None, (x.strip().replace(
-            b"%s: " % name, b'').replace(b"%s: " % name, b'') for x in match))))
+        x = ' '.join(list(filter(None, (x.strip().replace(
+            "%s: " % name, '').replace("%s: " % name, '') for x in match))))
         # remove multiple whitespaces by using a split hack
         # decode to latin-1 so it can be inserted in the database
-        return ' '.join(x.decode('latin-1').split())
+        return ' '.join(x.split())
     else:
         return None
 
 
 def parse_arin_inetnum(block: str) -> str:
     # ARIN WHOIS IPv4
-    match = re.findall(rb'^NetRange:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})', block, re.MULTILINE)
+    match = re.findall(r'^NetRange:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})', block, re.MULTILINE)
     if match:
         # netaddr can only handle strings, not bytes
-        ip_start = match[0][0].decode('utf-8')
-        ip_end = match[0][1].decode('utf-8')
+        ip_start = match[0][0]
+        ip_end = match[0][1]
         cidrs = iprange_to_cidrs(ip_start, ip_end)
         return cidrs
     # ARIN WHOIS IPv6
-    match = re.findall(rb'^NetRange:[\s]*([0-9a-fA-F:\/]{1,43})[\s]*-[\s]*([0-9a-fA-F:\/]{1,43})', block, re.MULTILINE)
+    match = re.findall(r'^NetRange:[\s]*([0-9a-fA-F:\/]{1,43})[\s]*-[\s]*([0-9a-fA-F:\/]{1,43})', block, re.MULTILINE)
     if match:
         # netaddr can only handle strings, not bytes
-        ip_start = match[0][0].decode('utf-8')
-        ip_end = match[0][1].decode('utf-8')
+        ip_start = match[0][0]
+        ip_end = match[0][1]
         cidrs = iprange_to_cidrs(ip_start, ip_end)
         return cidrs
     logger.warning(f"Could not parse ARIN block {block}")
@@ -157,6 +181,17 @@ def read_blocks(filename: str) -> list:
     return blocks
 
 
+def range_to_cidr(inetnum):
+    match = re.findall(r'((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})', inetnum, re.MULTILINE)
+    if match:
+        # netaddr can only handle strings, not bytes
+        ip_start = match[0][0]
+        ip_end = match[0][1]
+        return iprange_to_cidrs(ip_start, ip_end)[0]
+    else:
+        return inetnum
+
+
 def parse_blocks(blocks, csv_writer):
     def is_arin_customer(block):
         return block.startswith('OrgID:')
@@ -165,7 +200,17 @@ def parse_blocks(blocks, csv_writer):
         return block.startswith('NetHandle:') or block.startswith('V6NetHandle:')
 
     for block in blocks:
+        # The RPSL parser works on str not bytes
         b = block.decode('utf-8', 'ignore') 
+
+        inetnum = ''
+        netname = ''
+        description = ''
+        country = ''
+        maintained_by = ''
+        created = ''
+        last_modified = ''
+        source = ''
 
         # ARIN has an Organization object which you have to parse out in order
         # to get any details about network blocks
@@ -179,7 +224,7 @@ def parse_blocks(blocks, csv_writer):
         # ARIN's dump format is also not in RPSL for whatever reason. They
         # decided to make their own custom format.
         elif is_arin_network(b):
-            inetnum = parse_property_inetnum(b)
+            inetnum = parse_arin_inetnum(b)
             orgid = parse_property(b, 'OrgID')
             netname = parse_property(b, 'NetName')
             description = parse_property(b, 'NetHandle')
@@ -197,24 +242,52 @@ def parse_blocks(blocks, csv_writer):
         else:
             try:
                 rpsl_object = rpsl_object_from_text(b)
-                logger.info(rpsl_object)
+
+                if 'inetnum' in rpsl_object.parsed_data:
+                    inetnum = rpsl_object.parsed_data['inetnum']
+                elif 'inet6num' in rpsl_object.parsed_data:
+                    inetnum = rpsl_object.parsed_data['inet6num']
+                elif 'route' in rpsl_object.parsed_data:
+                    inetnum = rpsl_object.parsed_data['route']
+                elif 'route6' in rpsl_object.parsed_data:
+                    inetnum = rpsl_object.parsed_data['route6']
+                elif 'route-set' in rpsl_object.parsed_data:
+                    netname = rpsl_object.parsed_data['route-set']
+                    # Changes type from str -> list
+                    if 'members' in rpsl_object.parsed_data:
+                        inetnum = rpsl_object.parsed_data['members']
+
+                # Some of these might exist, or not, depends entirely on RIR/IRR
+                if 'netname' in rpsl_object.parsed_data:
+                    netname = rpsl_object.parsed_data['netname']
+                if 'descr' in rpsl_object.parsed_data:
+                    description = ' '.join(rpsl_object.parsed_data['descr'])
+                if 'country' in rpsl_object.parsed_data:
+                    country = ' '.join(rpsl_object.parsed_data['country'])
+                if 'mnt-by' in rpsl_object.parsed_data:
+                    maintained_by = ' '.join(rpsl_object.parsed_data['mnt-by'])
+                if 'last-modified' in rpsl_object.parsed_data:
+                    last_modified = ' '.join(rpsl_object.parsed_data['last-modified'])
+                if 'changed' in rpsl_object.parsed_data:
+                    last_modified = ' '.join(rpsl_object.parsed_data['changed'])
+                if 'created' in rpsl_object.parsed_data:
+                    created = ' '.join(rpsl_object.parsed_data['created'])
+                
+                # Source is special, we should always have a source value 
+                if 'source' in rpsl_object.parsed_data:
+                    source = rpsl_object.parsed_data['source']
+                else:
+                    source = parse_property(b, 'cust_source')
             except Exception as ex:
                 logger.error(ex)
-            # inetnum = parse_property_inetnum(block)
-            # netname = parse_property(block, b'netname')
-            # description = parse_property(block, b'descr')
-            # country = parse_property(block, b'country')
-            # maintained_by = parse_property(block, b'mnt-by')
-            # created = parse_property(block, b'created')
-            # last_modified = parse_property(block, b'last-modified')
-            # source = parse_property(block, b'cust_source')
 
         if isinstance(inetnum, list):
             for cidr in inetnum:
-                row = [str(cidr), netname, description, country, maintained_by, created, last_modified, source]
+                c = range_to_cidr(str(cidr))
+                row = [c, netname, description, country, maintained_by, created, last_modified, source]
                 csv_writer.writerow(row)
         else:
-            row = [inetnum.decode("utf-8"), netname, description, country, maintained_by, created, last_modified, source]
+            row = [range_to_cidr(inetnum), netname, description, country, maintained_by, created, last_modified, source]
             csv_writer.writerow(row)
 
 
@@ -239,6 +312,12 @@ def main(output_file):
                 logger.info(f"block parsing finished: {round(time.time() - start_time, 2)} seconds")
             else:
                 logger.info(f"File {f_name} not found. Please download using download_dumps.sh")
+
+            # Free the memory associated with the large dictionary
+            # since it is exclusive to ARIN's WHOIS database dump.
+            if entry == 'arin_db.txt':
+                global ARIN_ORGS
+                ARIN_ORGS = {}
 
     CURRENT_FILENAME = "empty"
     logger.info(f"script finished: {round(time.time() - overall_start_time, 2)} seconds")
